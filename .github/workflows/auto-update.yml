@@ -1,0 +1,78 @@
+# Auto-update — the Homebrew tap receiver (M2).
+#
+# Polls the PUBLIC beta channel pointer (no token, matching the seed's no-new-credentials discipline),
+# verifies the release's SHA-256SUMS minisign signature against the project's PUBLISHED artifact public
+# key (embedded in this repo as scripts/signing.pub — public material; the source repo is private, so the
+# tap cannot fetch the key credential-free), and — when the channel version differs from the formula's —
+# re-renders Formula/seed.rb + Casks/seed-desktop.rb with the source generator's exact templates, audits
+# them with Homebrew, and pushes '[skip ci] bump seed to <version>'.
+#
+# The same-repo push uses the workflow's own GITHUB_TOKEN (contents: write on the publish job only).
+# The sender (repository_dispatch in reality-connect/new-seed release.yml) stays credential-free: it
+# cannot reach this repo without a cross-repo token, so its dispatch is best-effort and this polling
+# receiver covers the flow with zero credentials.
+name: Auto-update
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: auto-update
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve the published channel
+    runs-on: ubuntu-latest
+    outputs:
+      status: ${{ steps.update.outputs.status }}
+      version: ${{ steps.update.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Fetch, verify and re-render (when the channel moved)
+        id: update
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          output="$(node scripts/auto-update.mjs)"
+          printf '%s\n' "$output"
+          status="$(printf '%s\n' "$output" | sed -n 's/^STATUS=//p' | tail -1)"
+          version="$(printf '%s\n' "$output" | sed -n 's/^VERSION=//p' | tail -1)"
+          test -n "$status" || { echo '::error::the receiver produced no status' >&2; exit 1; }
+          test -n "$version" || { echo '::error::the receiver produced no version' >&2; exit 1; }
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Audit and publish the bump
+    needs: resolve
+    if: needs.resolve.outputs.status == 'updated'
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Validate Ruby syntax
+        run: |
+          set -euo pipefail
+          ruby -c Formula/seed.rb
+          ruby -c Casks/seed-desktop.rb
+      - name: Audit with Homebrew
+        run: |
+          set -euo pipefail
+          brew tap reality-connect/tap "$GITHUB_WORKSPACE"
+          brew audit --strict reality-connect/tap/seed
+          brew audit --strict --cask reality-connect/tap/seed-desktop
+      - name: Commit and push the bump
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/seed.rb Casks/seed-desktop.rb
+          git commit -m "[skip ci] bump seed to ${{ needs.resolve.outputs.version }}"
+          git push
